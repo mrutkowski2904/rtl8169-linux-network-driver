@@ -24,16 +24,16 @@ static int rtl8169_netdev_init(struct rtl8169_context *ctx);
 static int rtl8169_probe(struct pci_dev *pci_dev, const struct pci_device_id *id);
 static void rtl8169_remove(struct pci_dev *pci_dev);
 
-static const struct pci_device_id rtl9168_ids[] = {
+static const struct pci_device_id rtl8169_ids[] = {
 	{PCI_VDEVICE(REALTEK, 0x8169)},
 	{},
 };
 
-MODULE_DEVICE_TABLE(pci, rtl9168_ids);
+MODULE_DEVICE_TABLE(pci, rtl8169_ids);
 
-static struct pci_driver rtl9168_driver = {
-	.name = "rtl9168",
-	.id_table = rtl9168_ids,
+static struct pci_driver rtl8169_driver = {
+	.name = "rtl8169",
+	.id_table = rtl8169_ids,
 	.probe = rtl8169_probe,
 	.remove = rtl8169_remove,
 };
@@ -45,7 +45,10 @@ static struct net_device_ops rtl8169_ndev_ops = {
 static netdev_tx_t rtl8169_ndo_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct rtl8169_context *ctx;
-	ctx = netdev_priv(dev);
+	struct rtl8169_net_context *net_ctx;
+	
+	net_ctx = netdev_priv(dev);
+	ctx = net_ctx->ctx;
 
 	dev_info_ratelimited(&ctx->pci_dev->dev, "in start xmit callback\n");
 
@@ -128,7 +131,7 @@ static void rtl8169_remove(struct pci_dev *pci_dev)
 	dev_info(&pci_dev->dev, "rtl8169 removed\n");
 }
 
-module_pci_driver(rtl9168_driver);
+module_pci_driver(rtl8169_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Maciej Rutkowski");
