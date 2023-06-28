@@ -19,12 +19,15 @@
 #define RTL8169_MMIO_MAR0 0x08
 #define RTL8169_MMIO_TNPDS 0x20
 #define RTL8169_MMIO_CMD 0x37
+#define RTL8169_MMIO_TPPOLL 0x38
 #define RTL8169_MMIO_IMASK 0x3c
 #define RTL8169_MMIO_ISTAT 0x3e
 #define RTL8169_MMIO_TXCFG 0x40
 #define RTL8169_MMIO_RXCFG 0x44
 #define RTL8169_MMIO_93C46CFG 0x50
+#define RTL8169_MMIO_MIS 0x5c
 #define RTL8169_MMIO_PHY 0x60
+#define RTL8169_MMIO_TBICSR 0x64
 #define RTL8169_MMIO_RMS 0xda
 #define RTL8169_MMIO_ETTHR 0xec
 #define RTL8169_MMIO_CPCMD 0xe0
@@ -37,6 +40,9 @@
 #define RTL8169_MMIO_CMD_TE_SHIFT 2
 #define RTL8169_MMIO_CMD_INIT_MASK ((1 << RTL8169_MMIO_CMD_TE_SHIFT) | (1 << RTL8169_MMIO_CMD_RE_SHIFT))
 
+/* TPPOLL */
+#define RTL8169_MMIO_TPPOLL_TX_PENDING_MASK (1 << 6)
+
 /* IMASK/ISTAT */
 #define RTL8169_MMIO_INT_FLAG_RX_OK_SHIFT 0
 #define RTL8169_MMIO_INT_FLAG_RX_ERR_SHIFT 1
@@ -47,20 +53,25 @@
 #define RTL8169_MMIO_INT_FLAG_RX_FIFO_OVF_SHIFT 6
 #define RTL8169_MMIO_INT_FLAG_TX_DESC_UNAVAL_SHIFT 7
 #define RTL8169_MMIO_INT_FLAG_SOFTWARE_SHIFT 8
-#define RTL8169_MMIO_INT_FLAG_IME_OUT_SHIFT 14
+#define RTL8169_MMIO_INT_FLAG_TIME_OUT_SHIFT 14
 #define RTL8169_MMIO_INT_FLAG_SYS_ERR_SHIFT 15
+#define RTL8169_MMIO_INT_INIT_MASK ((1 << RTL8169_MMIO_INT_FLAG_RX_OK_SHIFT) | (1 << RTL8169_MMIO_INT_FLAG_RX_ERR_SHIFT) | \
+									(1 << RTL8169_MMIO_INT_FLAG_TX_OK_SHIFT) | (1 << RTL8169_MMIO_INT_FLAG_TX_ERR_SHIFT))
 #define RTL8169_MMIO_INT_ALL_MASK 0xc1ff
 
 /* TXCFG */
 #define RTL8169_MMIO_TXCFG_DMA_BRST_UNLIMITED_MASK (0b111 << 8)
 #define RTL8169_MMIO_TXCFG_IFG_NORMAL_MASK (0b011 << 24)
+#define RTL8169_MMIO_TXCFG_LOOPBACK_MASK (0b01 << 17)
 #define RTL8169_MMIO_TXCFG_INIT_MASK (RTL8169_MMIO_TXCFG_DMA_BRST_UNLIMITED_MASK | RTL8169_MMIO_TXCFG_IFG_NORMAL_MASK)
 
 /* RXCFG */
-#define RTL8169_MMIO_RXCFG_ACCEPT_ALL_MASK (0b1111 << 0)
+#define RTL8169_MMIO_RXCFG_ACCEPT_ALL_MASK (0b111111 << 0)
 #define RTL8169_MMIO_RXCFG_DMA_BRST_UNLIMITED_MASK (0b111 << 8)
 #define RTL8169_MMIO_RXCFG_RXFIFO_NO_THS_MASK (0b111 << 13)
-#define RTL8169_MMIO_RXCFG_INIT_MASK (RTL8169_MMIO_RXCFG_ACCEPT_ALL_MASK | RTL8169_MMIO_RXCFG_DMA_BRST_UNLIMITED_MASK | RTL8169_MMIO_RXCFG_RXFIFO_NO_THS_MASK)
+#define RTL8169_MMIO_RXCFG_MERINT_MASK (1 << 24)
+#define RTL8169_MMIO_RXCFG_INIT_MASK (RTL8169_MMIO_RXCFG_ACCEPT_ALL_MASK | RTL8169_MMIO_RXCFG_DMA_BRST_UNLIMITED_MASK | \
+									  RTL8169_MMIO_RXCFG_RXFIFO_NO_THS_MASK | RTL8169_MMIO_RXCFG_MERINT_MASK)
 
 /* PHY */
 #define RTL8169_MMIO_PHY_DATA_SHIFT 0
@@ -77,6 +88,11 @@
 /* tx descriptor */
 #define RTL8169_TX_DESC_OPTS1_OWN_SHIFT 31
 #define RTL8169_TX_DESC_OPTS1_EOR_SHIFT 30
+#define RTL8169_TX_DESC_OPTS1_FS_SHIFT 29
+#define RTL8169_TX_DESC_OPTS1_LS_SHIFT 28
+#define RTL8169_TX_DESC_OPTS1_IPCS_SHIFT 18
+#define RTL8169_TX_DESC_OPTS1_UDPCS_SHIFT 17
+#define RTL8169_TX_DESC_OPTS1_TCPCS_SHIFT 16
 
 struct rtl8169_desc
 {
@@ -262,10 +278,31 @@ static irqreturn_t rtl8169_interrupt(int irq, void *data)
 	if (interrupt_status == 0)
 		return IRQ_NONE;
 
-	dev_info_ratelimited(&ctx->pci_dev->dev, "interrupt fired\n");
+	dev_info(&ctx->pci_dev->dev, "interrupt fired\n");
 
+	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_LINK_CHANGE_SHIFT))
+		dev_info(&ctx->pci_dev->dev, "link change detected\n");
+
+	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_RX_OK_SHIFT))
+	{
+		dev_info(&ctx->pci_dev->dev, "rx interrupt\n");
+	}
+
+	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_TX_DESC_UNAVAL_SHIFT))
+	{
+		dev_info(&ctx->pci_dev->dev, "tx desc unaval irq\n");
+	}
+
+	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_TX_OK_SHIFT))
+	{
+		dev_info(&ctx->pci_dev->dev, "tx interrupt\n");
+		netif_start_queue(ctx->ndev);
+	}
+
+	dev_info(&ctx->pci_dev->dev, "interrupt status = %d\n", interrupt_status);
 	/* ack interrupts */
 	iowrite16(interrupt_status, ctx->mmio_base + RTL8169_MMIO_ISTAT);
+
 	return IRQ_HANDLED;
 }
 
@@ -302,11 +339,72 @@ static netdev_tx_t rtl8169_ndo_start_xmit(struct sk_buff *skb, struct net_device
 {
 	struct rtl8169_context *ctx;
 	struct rtl8169_net_context *net_ctx;
+	struct rtl8169_desc *current_desc;
+	int data_size;
+	void *desc_data;
+	bool tx_ok = false;
 
 	net_ctx = netdev_priv(dev);
 	ctx = net_ctx->ctx;
 
 	dev_info_ratelimited(&ctx->pci_dev->dev, "in start xmit callback\n");
+
+	if (skb_shinfo(skb)->nr_frags)
+	{
+		dev_err_ratelimited(&ctx->pci_dev->dev, "fragmented tx not supported\n");
+		kfree_skb(skb);
+		return NETDEV_TX_OK;
+	}
+
+	data_size = skb_headlen(skb);
+	if (data_size >= RTL8169_DATA_BUFF_SIZE)
+	{
+		dev_err_ratelimited(&ctx->pci_dev->dev, "data too big to transmit\n");
+		kfree_skb(skb);
+		return NETDEV_TX_OK;
+	}
+
+	for (int i = 0; i < RTL8169_TX_DESC_COUNT; i++)
+	{
+		current_desc = &ctx->tx_descriptors[i];
+
+		if (!(current_desc->opts1 & (1 << RTL8169_TX_DESC_OPTS1_OWN_SHIFT)))
+		{
+			tx_ok = true;
+			desc_data = ctx->tx_data_buffers[i];
+			memcpy(desc_data, skb->data, data_size);
+
+			current_desc->opts1 = (data_size & 0x3fff);
+			current_desc->opts1 |= ((1 << RTL8169_TX_DESC_OPTS1_OWN_SHIFT) |
+									(1 << RTL8169_TX_DESC_OPTS1_FS_SHIFT) |
+									(1 << RTL8169_TX_DESC_OPTS1_LS_SHIFT)
+									/*
+									| (1 << RTL8169_TX_DESC_OPTS1_IPCS_SHIFT) |
+									(1 << RTL8169_TX_DESC_OPTS1_UDPCS_SHIFT) |
+									(1 << RTL8169_TX_DESC_OPTS1_TCPCS_SHIFT)
+									*/
+			);
+
+			if (i == (RTL8169_TX_DESC_COUNT - 1))
+				current_desc->opts1 |= (1 << RTL8169_TX_DESC_OPTS1_EOR_SHIFT);
+
+			current_desc->opts2 = 0;
+
+			current_desc->bus_addr_low = virt_to_bus(ctx->tx_data_buffers[i]) & 0xffffffff;
+			current_desc->bus_addr_high = (virt_to_bus(ctx->tx_data_buffers[i]) >> 32) & 0xffffffff;
+
+			break;
+		}
+	}
+
+	if (!tx_ok)
+		return NETDEV_TX_BUSY;
+
+	/* notify the card that tx is pending */
+	iowrite8(RTL8169_MMIO_TPPOLL_TX_PENDING_MASK, ctx->mmio_base + RTL8169_MMIO_TPPOLL);
+
+	/* enabled in interrupt handler after data is sent */
+	netif_stop_queue(ctx->ndev);
 
 	kfree_skb(skb);
 	return NETDEV_TX_OK;
@@ -323,7 +421,7 @@ static int rtl8169_netdev_init(struct rtl8169_context *ctx)
 
 	ctx->ndev->dev.parent = &ctx->pci_dev->dev;
 	ctx->ndev->netdev_ops = &rtl8169_ndev_ops;
-	ctx->ndev->features = NETIF_F_RXCSUM;
+	ctx->ndev->features = 0;
 	eth_hw_addr_set(ctx->ndev, ctx->mac);
 
 	net_ctx = netdev_priv(ctx->ndev);
@@ -390,7 +488,7 @@ static int rtl8169_chip_init(struct rtl8169_context *ctx)
 		/* write bus address of the buffer to the rx descriptor */
 		current_desc->bus_addr_low = virt_to_bus(ctx->tx_data_buffers[i]) & 0xffffffff;
 		current_desc->bus_addr_high = (virt_to_bus(ctx->tx_data_buffers[i]) >> 32) & 0xffffffff;
-
+		current_desc->opts1 = 0;
 		if (i == (RTL8169_TX_DESC_COUNT - 1))
 			current_desc->opts1 |= (1 << RTL8169_TX_DESC_OPTS1_EOR_SHIFT);
 
@@ -426,7 +524,8 @@ static int rtl8169_chip_init(struct rtl8169_context *ctx)
 	iowrite32((virt_to_bus(ctx->tx_descriptors) >> 32) & 0xffffffff, ctx->mmio_base + RTL8169_MMIO_TNPDS + 4);
 
 	/* configure interrupts */
-	iowrite16(RTL8169_MMIO_INT_ALL_MASK, ctx->mmio_base + RTL8169_MMIO_IMASK);
+	iowrite16(RTL8169_MMIO_INT_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_IMASK);
+	iowrite16(8, ctx->mmio_base + RTL8169_MMIO_MIS);
 
 	/* rx/tx enabled */
 	iowrite8(RTL8169_MMIO_CMD_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_CMD);
