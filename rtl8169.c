@@ -56,8 +56,8 @@
 #define RTL8169_MMIO_INT_FLAG_TIME_OUT_SHIFT 14
 #define RTL8169_MMIO_INT_FLAG_SYS_ERR_SHIFT 15
 #define RTL8169_MMIO_INT_INIT_MASK ((1 << RTL8169_MMIO_INT_FLAG_RX_OK_SHIFT) | (1 << RTL8169_MMIO_INT_FLAG_RX_ERR_SHIFT) | \
-									(1 << RTL8169_MMIO_INT_FLAG_TX_OK_SHIFT) | (1 << RTL8169_MMIO_INT_FLAG_TX_ERR_SHIFT))
-#define RTL8169_MMIO_INT_ALL_MASK 0xc1ff
+									(1 << RTL8169_MMIO_INT_FLAG_TX_OK_SHIFT) | (1 << RTL8169_MMIO_INT_FLAG_TX_ERR_SHIFT) | \
+									(1 << RTL8169_MMIO_INT_FLAG_LINK_CHANGE_SHIFT))
 
 /* TXCFG */
 #define RTL8169_MMIO_TXCFG_DMA_BRST_UNLIMITED_MASK (0b111 << 8)
@@ -100,7 +100,7 @@ struct rtl8169_desc
 	u32 opts2;
 	u32 bus_addr_low;
 	u32 bus_addr_high;
-} __attribute__((packed));
+};
 
 struct rtl8169_context
 {
@@ -117,11 +117,12 @@ struct rtl8169_context
 	 * size of the array is RTL8169_*_DESC_COUNT */
 	struct rtl8169_desc *rx_descriptors;
 	struct rtl8169_desc *tx_descriptors;
+	int tx_index;
 
 	/* arrays of addresses used in rx/tx descriptor buffers
 	 * each buffer is of RTL8169_DATA_BUFF_SIZE bytes */
-	void *rx_data_buffers[RTL8169_RX_DESC_COUNT];
-	void *tx_data_buffers[RTL8169_TX_DESC_COUNT];
+	u8 *rx_data_buffers[RTL8169_RX_DESC_COUNT];
+	u8 *tx_data_buffers[RTL8169_TX_DESC_COUNT];
 };
 
 struct rtl8169_net_context
@@ -281,7 +282,10 @@ static irqreturn_t rtl8169_interrupt(int irq, void *data)
 	dev_info(&ctx->pci_dev->dev, "interrupt fired\n");
 
 	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_LINK_CHANGE_SHIFT))
-		dev_info(&ctx->pci_dev->dev, "link change detected\n");
+	{
+		dev_info_ratelimited(&ctx->pci_dev->dev, "link change detected\n");
+		phy_mac_interrupt(ctx->phydev);
+	}
 
 	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_RX_OK_SHIFT))
 	{
@@ -291,6 +295,8 @@ static irqreturn_t rtl8169_interrupt(int irq, void *data)
 	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_TX_DESC_UNAVAL_SHIFT))
 	{
 		dev_info(&ctx->pci_dev->dev, "tx desc unaval irq\n");
+		dev_info(&ctx->pci_dev->dev, "buffer addr %llu and %u\n", virt_to_bus(ctx->tx_data_buffers[0]), ctx->tx_descriptors[0].bus_addr_low);
+		netif_start_queue(ctx->ndev);
 	}
 
 	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_TX_OK_SHIFT))
@@ -299,7 +305,7 @@ static irqreturn_t rtl8169_interrupt(int irq, void *data)
 		netif_start_queue(ctx->ndev);
 	}
 
-	dev_info(&ctx->pci_dev->dev, "interrupt status = %d\n", interrupt_status);
+	dev_info(&ctx->pci_dev->dev, "interrupt status = %d\nearly rx status = %d\n", interrupt_status, ioread8(ctx->mmio_base + 0x36));
 	/* ack interrupts */
 	iowrite16(interrupt_status, ctx->mmio_base + RTL8169_MMIO_ISTAT);
 
@@ -341,12 +347,13 @@ static netdev_tx_t rtl8169_ndo_start_xmit(struct sk_buff *skb, struct net_device
 	struct rtl8169_net_context *net_ctx;
 	struct rtl8169_desc *current_desc;
 	int data_size;
-	void *desc_data;
-	bool tx_ok = false;
+	int current_index;
+	u8 *desc_buff;
 
 	net_ctx = netdev_priv(dev);
 	ctx = net_ctx->ctx;
 
+	current_index = ctx->tx_index % RTL8169_TX_DESC_COUNT;
 	dev_info_ratelimited(&ctx->pci_dev->dev, "in start xmit callback\n");
 
 	if (skb_shinfo(skb)->nr_frags)
@@ -364,47 +371,42 @@ static netdev_tx_t rtl8169_ndo_start_xmit(struct sk_buff *skb, struct net_device
 		return NETDEV_TX_OK;
 	}
 
-	for (int i = 0; i < RTL8169_TX_DESC_COUNT; i++)
+	current_desc = &ctx->tx_descriptors[current_index];
+
+	if (current_desc->opts1 & (1 << RTL8169_TX_DESC_OPTS1_OWN_SHIFT))
 	{
-		current_desc = &ctx->tx_descriptors[i];
-
-		if (!(current_desc->opts1 & (1 << RTL8169_TX_DESC_OPTS1_OWN_SHIFT)))
-		{
-			tx_ok = true;
-			desc_data = ctx->tx_data_buffers[i];
-			memcpy(desc_data, skb->data, data_size);
-
-			current_desc->opts1 = (data_size & 0x3fff);
-			current_desc->opts1 |= ((1 << RTL8169_TX_DESC_OPTS1_OWN_SHIFT) |
-									(1 << RTL8169_TX_DESC_OPTS1_FS_SHIFT) |
-									(1 << RTL8169_TX_DESC_OPTS1_LS_SHIFT)
-									/*
-									| (1 << RTL8169_TX_DESC_OPTS1_IPCS_SHIFT) |
-									(1 << RTL8169_TX_DESC_OPTS1_UDPCS_SHIFT) |
-									(1 << RTL8169_TX_DESC_OPTS1_TCPCS_SHIFT)
-									*/
-			);
-
-			if (i == (RTL8169_TX_DESC_COUNT - 1))
-				current_desc->opts1 |= (1 << RTL8169_TX_DESC_OPTS1_EOR_SHIFT);
-
-			current_desc->opts2 = 0;
-
-			current_desc->bus_addr_low = virt_to_bus(ctx->tx_data_buffers[i]) & 0xffffffff;
-			current_desc->bus_addr_high = (virt_to_bus(ctx->tx_data_buffers[i]) >> 32) & 0xffffffff;
-
-			break;
-		}
+		dev_info_ratelimited(&ctx->pci_dev->dev, "interface is busy\n");
+		return NETDEV_TX_BUSY;
 	}
 
-	if (!tx_ok)
-		return NETDEV_TX_BUSY;
+	desc_buff = ctx->tx_data_buffers[current_index];
+	memcpy(desc_buff, skb->data, data_size);
+
+	current_desc->opts1 = (data_size & 0x3fff);
+	current_desc->opts1 |= ((1 << RTL8169_TX_DESC_OPTS1_OWN_SHIFT) |
+							(1 << RTL8169_TX_DESC_OPTS1_FS_SHIFT) |
+							(1 << RTL8169_TX_DESC_OPTS1_LS_SHIFT)
+							/*
+							| (1 << RTL8169_TX_DESC_OPTS1_IPCS_SHIFT) |
+							(1 << RTL8169_TX_DESC_OPTS1_UDPCS_SHIFT) |
+							(1 << RTL8169_TX_DESC_OPTS1_TCPCS_SHIFT)
+							*/
+	);
+
+	if (current_index == (RTL8169_TX_DESC_COUNT - 1))
+		current_desc->opts1 |= (1 << RTL8169_TX_DESC_OPTS1_EOR_SHIFT);
+
+	current_desc->opts2 = 0;
 
 	/* notify the card that tx is pending */
 	iowrite8(RTL8169_MMIO_TPPOLL_TX_PENDING_MASK, ctx->mmio_base + RTL8169_MMIO_TPPOLL);
 
 	/* enabled in interrupt handler after data is sent */
 	netif_stop_queue(ctx->ndev);
+
+	ctx->tx_index++;
+	if (ctx->tx_index == RTL8169_TX_DESC_COUNT)
+		ctx->tx_index = 0;
 
 	kfree_skb(skb);
 	return NETDEV_TX_OK;
@@ -478,6 +480,7 @@ static int rtl8169_chip_init(struct rtl8169_context *ctx)
 	if (ctx->tx_descriptors == NULL)
 		return -ENOMEM;
 
+	ctx->tx_index = 0;
 	for (int i = 0; i < RTL8169_TX_DESC_COUNT; i++)
 	{
 		current_desc = &ctx->tx_descriptors[i];
@@ -486,8 +489,8 @@ static int rtl8169_chip_init(struct rtl8169_context *ctx)
 			return -ENOMEM;
 
 		/* write bus address of the buffer to the rx descriptor */
-		current_desc->bus_addr_low = virt_to_bus(ctx->tx_data_buffers[i]) & 0xffffffff;
-		current_desc->bus_addr_high = (virt_to_bus(ctx->tx_data_buffers[i]) >> 32) & 0xffffffff;
+		current_desc->bus_addr_low = virt_to_bus(ctx->tx_data_buffers[i]) & DMA_BIT_MASK(32);
+		current_desc->bus_addr_high = (virt_to_bus(ctx->tx_data_buffers[i]) >> 32);
 		current_desc->opts1 = 0;
 		if (i == (RTL8169_TX_DESC_COUNT - 1))
 			current_desc->opts1 |= (1 << RTL8169_TX_DESC_OPTS1_EOR_SHIFT);
@@ -495,43 +498,6 @@ static int rtl8169_chip_init(struct rtl8169_context *ctx)
 		/* unused */
 		current_desc->opts2 = 0;
 	}
-
-	/* apply configuration */
-	/* unlock configuration registers */
-	rtl8169_enable_config_write(ctx);
-
-	/* rx config */
-	iowrite32(RTL8169_MMIO_RXCFG_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_RXCFG);
-
-	/* enable tx */
-	iowrite8(1 << RTL8169_MMIO_CMD_TE_SHIFT, ctx->mmio_base + RTL8169_MMIO_CMD);
-
-	/* tx config */
-	iowrite32(RTL8169_MMIO_TXCFG_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_TXCFG);
-
-	/* max rx packet size */
-	iowrite16(RTL8169_DATA_BUFF_SIZE, ctx->mmio_base + RTL8169_MMIO_RMS);
-
-	/* minimum tx threshold, will also send packet if at least one whole package is pending */
-	iowrite8(0x3B, ctx->mmio_base + RTL8169_MMIO_ETTHR);
-
-	/* write bus address of rx descriptors array to the hardware */
-	iowrite32(virt_to_bus(ctx->rx_descriptors) & 0xffffffff, ctx->mmio_base + RTL8169_MMIO_RDSAR);
-	iowrite32((virt_to_bus(ctx->rx_descriptors) >> 32) & 0xffffffff, ctx->mmio_base + RTL8169_MMIO_RDSAR + 4);
-
-	/* write bus address of tx descriptors array to the hardware */
-	iowrite32(virt_to_bus(ctx->tx_descriptors) & 0xffffffff, ctx->mmio_base + RTL8169_MMIO_TNPDS);
-	iowrite32((virt_to_bus(ctx->tx_descriptors) >> 32) & 0xffffffff, ctx->mmio_base + RTL8169_MMIO_TNPDS + 4);
-
-	/* configure interrupts */
-	iowrite16(RTL8169_MMIO_INT_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_IMASK);
-	iowrite16(8, ctx->mmio_base + RTL8169_MMIO_MIS);
-
-	/* rx/tx enabled */
-	iowrite8(RTL8169_MMIO_CMD_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_CMD);
-
-	/* lock configuration registers */
-	rtl8169_disable_config_write(ctx);
 
 	/* setup PHY */
 	mii = devm_mdiobus_alloc(&ctx->pci_dev->dev);
@@ -562,6 +528,49 @@ static int rtl8169_chip_init(struct rtl8169_context *ctx)
 		dev_err(&ctx->pci_dev->dev, "no dedicated PHY driver found\n");
 		return -EUNATCH;
 	}
+
+	/* apply configuration */
+	/* unlock configuration registers */
+	rtl8169_enable_config_write(ctx);
+	wmb();
+
+	/* rx config */
+	iowrite32(RTL8169_MMIO_RXCFG_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_RXCFG);
+
+	/* enable tx */
+	iowrite8(1 << RTL8169_MMIO_CMD_TE_SHIFT, ctx->mmio_base + RTL8169_MMIO_CMD);
+
+	/* tx config */
+	iowrite32(RTL8169_MMIO_TXCFG_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_TXCFG);
+
+	/* max rx packet size */
+	iowrite16(RTL8169_DATA_BUFF_SIZE, ctx->mmio_base + RTL8169_MMIO_RMS);
+
+	/* minimum tx threshold, will also send packet if at least one whole package is pending */
+	iowrite8(0x3B, ctx->mmio_base + RTL8169_MMIO_ETTHR);
+
+	/* write bus address of rx descriptors array to the hardware */
+	iowrite32(virt_to_bus(ctx->rx_descriptors) & DMA_BIT_MASK(32), ctx->mmio_base + RTL8169_MMIO_RDSAR);
+	iowrite32((virt_to_bus(ctx->rx_descriptors) >> 32), ctx->mmio_base + RTL8169_MMIO_RDSAR + 4);
+
+	/* write bus address of tx descriptors array to the hardware */
+	iowrite32(virt_to_bus(ctx->tx_descriptors) & DMA_BIT_MASK(32), ctx->mmio_base + RTL8169_MMIO_TNPDS);
+	iowrite32((virt_to_bus(ctx->tx_descriptors) >> 32), ctx->mmio_base + RTL8169_MMIO_TNPDS + 4);
+
+	/* configure interrupts */
+	iowrite16(RTL8169_MMIO_INT_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_IMASK);
+	/* iowrite16(8, ctx->mmio_base + RTL8169_MMIO_MIS); */
+
+	/* rx/tx enabled */
+	iowrite8(RTL8169_MMIO_CMD_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_CMD);
+
+	/* accept all */
+	iowrite32(0xffffffff, ctx->mmio_base + RTL8169_MMIO_MAR0);
+	iowrite32(0xffffffff, ctx->mmio_base + RTL8169_MMIO_MAR0 + 4);
+
+	/* lock configuration registers */
+	rtl8169_disable_config_write(ctx);
+	wmb();
 
 	return 0;
 }
@@ -633,11 +642,11 @@ static int rtl8169_probe(struct pci_dev *pci_dev, const struct pci_device_id *id
 		return status;
 
 	/* prepare PHY */
-	status = phy_connect_direct(ctx->ndev, ctx->phydev, rtl8169_phylink_handler, PHY_INTERFACE_MODE_MII);
+	status = phy_connect_direct(ctx->ndev, ctx->phydev, rtl8169_phylink_handler, PHY_INTERFACE_MODE_GMII);
 	if (status)
 		return status;
 
-	phy_set_max_speed(ctx->phydev, SPEED_100);
+	// phy_set_max_speed(ctx->phydev, SPEED_1000);
 	phy_attached_info(ctx->phydev);
 	phy_init_hw(ctx->phydev);
 	phy_start(ctx->phydev);
