@@ -66,9 +66,10 @@
 #define RTL8169_MMIO_RXCFG_ACCEPT_ALL_MASK (0b111111 << 0)
 #define RTL8169_MMIO_RXCFG_DMA_BRST_UNLIMITED_MASK (0b111 << 8)
 #define RTL8169_MMIO_RXCFG_RXFIFO_NO_THS_MASK (0b111 << 13)
+#define RTL8169_MMIO_RXCFG_RXFIFO_64_THS_MASK (0b010 << 13)
 #define RTL8169_MMIO_RXCFG_MERINT_MASK (1 << 24)
 #define RTL8169_MMIO_RXCFG_INIT_MASK (RTL8169_MMIO_RXCFG_ACCEPT_ALL_MASK | RTL8169_MMIO_RXCFG_DMA_BRST_UNLIMITED_MASK | \
-									  RTL8169_MMIO_RXCFG_RXFIFO_NO_THS_MASK)
+									  RTL8169_MMIO_RXCFG_RXFIFO_64_THS_MASK)
 
 /* PHY */
 #define RTL8169_MMIO_PHY_DATA_SHIFT 0
@@ -138,6 +139,7 @@ static void rtl8169_phylink_handler(struct net_device *dev);
 static void rtl8169_enable_config_write(struct rtl8169_context *ctx);
 static void rtl8169_disable_config_write(struct rtl8169_context *ctx);
 static void rtl8169_reset_chip(struct rtl8169_context *ctx);
+static void rtl8169_handle_rx(struct rtl8169_context *ctx);
 
 /* interrupt handler */
 static irqreturn_t rtl8169_interrupt(int irq, void *data);
@@ -268,6 +270,37 @@ static void rtl8169_reset_chip(struct rtl8169_context *ctx)
 	mdelay(10);
 }
 
+static void rtl8169_handle_rx(struct rtl8169_context *ctx)
+{
+	u16 rx_size;
+	struct sk_buff *skb;
+
+	/* get len from descriptor */
+	rx_size = ctx->rx_descriptor->opts1 & 0x3fff;
+
+	skb = dev_alloc_skb(rx_size);
+	if (!skb)
+	{
+		dev_err_ratelimited(&ctx->pci_dev->dev, "could not allocate skb!\n");
+		return;
+	}
+
+	/* **************************************** */
+	/* TODO: Check RTL8169_MMIO_RXCFG_INIT_MASK */
+	/* **************************************** */
+	
+	skb_copy_to_linear_data(skb, ctx->rx_data_buffer, rx_size);
+	skb->tail += rx_size;
+	skb->len = rx_size;
+	if (netif_rx(skb) == NET_RX_DROP)
+		dev_err_ratelimited(&ctx->pci_dev->dev, "rx skb dropped!\n");
+
+	/* prepare for rx */
+	ctx->rx_descriptor->opts1 = ((1 << RTL8169_RX_DESC_OPTS1_OWN_SHIFT) |
+								 (1 << RTL8169_RX_DESC_OPTS1_EOR_SHIFT) |
+								 (RTL8169_DATA_BUFF_SIZE & 0x3fff));
+}
+
 static irqreturn_t rtl8169_interrupt(int irq, void *data)
 {
 	u16 interrupt_status;
@@ -289,9 +322,10 @@ static irqreturn_t rtl8169_interrupt(int irq, void *data)
 	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_RX_OK_SHIFT))
 	{
 		dev_info(&ctx->pci_dev->dev, "rx interrupt\n");
+		rtl8169_handle_rx(ctx);
 	}
 
-	/* 
+	/*
 	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_TX_DESC_UNAVAL_SHIFT))
 	{
 		dev_info(&ctx->pci_dev->dev, "tx desc unaval irq\n");
