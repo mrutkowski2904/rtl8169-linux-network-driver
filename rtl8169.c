@@ -278,20 +278,16 @@ static void rtl8169_handle_rx(struct rtl8169_context *ctx)
 	/* get len from descriptor */
 	rx_size = ctx->rx_descriptor->opts1 & 0x3fff;
 
-	skb = dev_alloc_skb(rx_size);
+	skb = netdev_alloc_skb(ctx->ndev, rx_size + 2);
 	if (!skb)
 	{
 		dev_err_ratelimited(&ctx->pci_dev->dev, "could not allocate skb!\n");
 		return;
 	}
 
-	/* **************************************** */
-	/* TODO: Check RTL8169_MMIO_RXCFG_INIT_MASK */
-	/* **************************************** */
-	
 	skb_copy_to_linear_data(skb, ctx->rx_data_buffer, rx_size);
-	skb->tail += rx_size;
-	skb->len = rx_size;
+	skb_put(skb, rx_size);
+	skb->protocol = eth_type_trans(skb, ctx->ndev);
 	if (netif_rx(skb) == NET_RX_DROP)
 		dev_err_ratelimited(&ctx->pci_dev->dev, "rx skb dropped!\n");
 
@@ -311,34 +307,12 @@ static irqreturn_t rtl8169_interrupt(int irq, void *data)
 	if (interrupt_status == 0)
 		return IRQ_NONE;
 
-	dev_info(&ctx->pci_dev->dev, "interrupt fired\n");
-
 	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_LINK_CHANGE_SHIFT))
-	{
-		dev_info_ratelimited(&ctx->pci_dev->dev, "link change detected\n");
 		phy_mac_interrupt(ctx->phydev);
-	}
 
 	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_RX_OK_SHIFT))
-	{
-		dev_info(&ctx->pci_dev->dev, "rx interrupt\n");
 		rtl8169_handle_rx(ctx);
-	}
 
-	/*
-	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_TX_DESC_UNAVAL_SHIFT))
-	{
-		dev_info(&ctx->pci_dev->dev, "tx desc unaval irq\n");
-	}
-	*/
-
-	if (interrupt_status & (1 << RTL8169_MMIO_INT_FLAG_TX_OK_SHIFT))
-	{
-		dev_info(&ctx->pci_dev->dev, "tx interrupt\n");
-		/* netif_start_queue(ctx->ndev); */
-	}
-
-	dev_info(&ctx->pci_dev->dev, "interrupt status = %d early rx status = %d\n", interrupt_status, ioread8(ctx->mmio_base + 0x36));
 	/* ack interrupts */
 	iowrite16(interrupt_status, ctx->mmio_base + RTL8169_MMIO_ISTAT);
 
@@ -383,8 +357,6 @@ static netdev_tx_t rtl8169_ndo_start_xmit(struct sk_buff *skb, struct net_device
 	net_ctx = netdev_priv(dev);
 	ctx = net_ctx->ctx;
 
-	dev_info_ratelimited(&ctx->pci_dev->dev, "in start xmit callback\n");
-
 	if (skb_shinfo(skb)->nr_frags)
 	{
 		dev_err_ratelimited(&ctx->pci_dev->dev, "fragmented tx not supported\n");
@@ -400,8 +372,6 @@ static netdev_tx_t rtl8169_ndo_start_xmit(struct sk_buff *skb, struct net_device
 		return NETDEV_TX_OK;
 	}
 
-	pr_info("sending %d bytes\n", data_size);
-
 	if (ctx->tx_descriptor->opts1 & (1 << RTL8169_TX_DESC_OPTS1_OWN_SHIFT))
 	{
 		dev_info_ratelimited(&ctx->pci_dev->dev, "interface is busy\n");
@@ -414,21 +384,12 @@ static netdev_tx_t rtl8169_ndo_start_xmit(struct sk_buff *skb, struct net_device
 	ctx->tx_descriptor->opts1 |= ((1 << RTL8169_TX_DESC_OPTS1_OWN_SHIFT) |
 								  (1 << RTL8169_TX_DESC_OPTS1_EOR_SHIFT) |
 								  (1 << RTL8169_TX_DESC_OPTS1_FS_SHIFT) |
-								  (1 << RTL8169_TX_DESC_OPTS1_LS_SHIFT)
-								  /*
-								  | (1 << RTL8169_TX_DESC_OPTS1_IPCS_SHIFT) |
-								  (1 << RTL8169_TX_DESC_OPTS1_UDPCS_SHIFT) |
-								  (1 << RTL8169_TX_DESC_OPTS1_TCPCS_SHIFT)
-								  */
-	);
+								  (1 << RTL8169_TX_DESC_OPTS1_LS_SHIFT));
 
 	ctx->tx_descriptor->opts2 = 0;
 
 	/* notify the card that tx is pending */
 	iowrite8(RTL8169_MMIO_TPPOLL_TX_PENDING_MASK, ctx->mmio_base + RTL8169_MMIO_TPPOLL);
-
-	/* enabled in interrupt handler after data is sent */
-	/* netif_stop_queue(ctx->ndev); */
 
 	kfree_skb(skb);
 	return NETDEV_TX_OK;
@@ -534,7 +495,6 @@ static int rtl8169_chip_init(struct rtl8169_context *ctx)
 	/* apply configuration */
 	/* unlock configuration registers */
 	rtl8169_enable_config_write(ctx);
-	wmb();
 
 	/* rx config */
 	iowrite32(RTL8169_MMIO_RXCFG_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_RXCFG);
@@ -560,10 +520,7 @@ static int rtl8169_chip_init(struct rtl8169_context *ctx)
 	iowrite32(ctx->tx_descriptor_bus_addr >> 32, ctx->mmio_base + RTL8169_MMIO_TNPDS + 4);
 
 	/* configure interrupts */
-	/* TODO: remove - debug, all interrupts */
-	/* iowrite16(0xC1FF, ctx->mmio_base + RTL8169_MMIO_IMASK); */
 	iowrite16(RTL8169_MMIO_INT_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_IMASK);
-	/* iowrite16(8, ctx->mmio_base + RTL8169_MMIO_MIS); */
 
 	/* rx/tx enabled */
 	iowrite8(RTL8169_MMIO_CMD_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_CMD);
@@ -574,7 +531,6 @@ static int rtl8169_chip_init(struct rtl8169_context *ctx)
 
 	/* lock configuration registers */
 	rtl8169_disable_config_write(ctx);
-	wmb();
 
 	return 0;
 }
@@ -650,7 +606,6 @@ static int rtl8169_probe(struct pci_dev *pci_dev, const struct pci_device_id *id
 	if (status)
 		return status;
 
-	// phy_set_max_speed(ctx->phydev, SPEED_1000);
 	phy_attached_info(ctx->phydev);
 	phy_init_hw(ctx->phydev);
 	phy_start(ctx->phydev);

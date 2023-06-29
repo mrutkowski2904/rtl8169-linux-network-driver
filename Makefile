@@ -1,5 +1,5 @@
 obj-m += rtl8169.o
-ccflags-y := -DDEBUG -g -std=gnu99 -Wno-declaration-after-statement
+ccflags-y := -std=gnu99 -Wno-declaration-after-statement
 .PHONY: all clean
 
 all:
