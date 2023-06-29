@@ -3,5 +3,7 @@
 !README.md
 !.gitignore
 !Makefile
-
+!img
+!img/*.jpg
+!img/*.png
 !rtl8169.c

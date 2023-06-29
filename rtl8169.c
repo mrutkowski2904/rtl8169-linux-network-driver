@@ -30,7 +30,7 @@
 #define RTL8169_MMIO_CPCMD 0xe0
 #define RTL8169_MMIO_RDSAR 0xe4
 
-/* offsets in registers */
+/* offsets and masks for registers */
 /* CMD */
 #define RTL8169_MMIO_CMD_RST_SHIFT 4
 #define RTL8169_MMIO_CMD_RE_SHIFT 3
