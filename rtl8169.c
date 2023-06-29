@@ -367,16 +367,13 @@ static netdev_tx_t rtl8169_ndo_start_xmit(struct sk_buff *skb, struct net_device
 	data_size = skb_headlen(skb);
 	if (data_size >= RTL8169_DATA_BUFF_SIZE)
 	{
-		dev_err_ratelimited(&ctx->pci_dev->dev, "data too big to transmit\n");
+		dev_err_ratelimited(&ctx->pci_dev->dev, "data is too big to transmit\n");
 		kfree_skb(skb);
 		return NETDEV_TX_OK;
 	}
 
 	if (ctx->tx_descriptor->opts1 & (1 << RTL8169_TX_DESC_OPTS1_OWN_SHIFT))
-	{
-		dev_info_ratelimited(&ctx->pci_dev->dev, "interface is busy\n");
 		return NETDEV_TX_BUSY;
-	}
 
 	memcpy(ctx->tx_data_buffer, skb->data, data_size);
 
@@ -467,11 +464,11 @@ static int rtl8169_chip_init(struct rtl8169_context *ctx)
 	if (mii == NULL)
 		return -ENOMEM;
 
-	mii->name = "r8169";
+	mii->name = "rtl8169";
 	mii->priv = ctx;
 	mii->parent = &ctx->pci_dev->dev;
 	mii->irq[0] = PHY_MAC_INTERRUPT;
-	snprintf(mii->id, MII_BUS_ID_SIZE, "r8169-%x-%x",
+	snprintf(mii->id, MII_BUS_ID_SIZE, "rtl8169-%x-%x",
 			 pci_domain_nr(ctx->pci_dev->bus), pci_dev_id(ctx->pci_dev));
 
 	mii->read = rtl8169_mdio_read;
