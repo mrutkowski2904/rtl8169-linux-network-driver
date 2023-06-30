@@ -534,7 +534,7 @@ static int rtl8169_chip_init(struct rtl8169_context *ctx)
 
 static int rtl8169_probe(struct pci_dev *pci_dev, const struct pci_device_id *id)
 {
-	int status, mmio_region;
+	int status;
 	struct rtl8169_context *ctx;
 
 	ctx = devm_kzalloc(&pci_dev->dev, sizeof(struct rtl8169_context), GFP_KERNEL);
@@ -557,23 +557,19 @@ static int rtl8169_probe(struct pci_dev *pci_dev, const struct pci_device_id *id
 	if (pcim_set_mwi(pci_dev) < 0)
 		dev_info(&pci_dev->dev, "mem wr inval unavailable\n");
 
-	mmio_region = ffs(pci_select_bars(pci_dev, IORESOURCE_MEM)) - 1;
-	if (mmio_region < 0)
+	status = pci_request_regions(pci_dev, "rtl8169");
+	if (status)
 	{
-		dev_err(&pci_dev->dev, "could not find MMIO region\n");
+		dev_err(&pci_dev->dev, "could not request memory regions\n");
 		return -ENODEV;
 	}
 
-	status = pcim_iomap_regions(pci_dev, BIT(mmio_region), "rtl8169");
-	if (status < 0)
+	ctx->mmio_base = pcim_iomap(pci_dev, 0, 0);
+	if (ctx->mmio_base == NULL)
 	{
 		dev_err(&pci_dev->dev, "could not remap MMIO region\n");
 		return status;
 	}
-
-	ctx->mmio_base = pcim_iomap_table(pci_dev)[mmio_region];
-	if (ctx->mmio_base == NULL)
-		return -ENOMEM;
 
 	status = pci_alloc_irq_vectors(pci_dev, 1, 1, PCI_IRQ_LEGACY);
 	if (status < 0)
@@ -584,24 +580,25 @@ static int rtl8169_probe(struct pci_dev *pci_dev, const struct pci_device_id *id
 	if (status < 0)
 	{
 		dev_err(&pci_dev->dev, "error while requesting irq\n");
-		return status;
+		goto undo_irq_alloc;
 	}
 
 	status = rtl8169_chip_init(ctx);
 	if (status < 0)
 	{
 		dev_err(&pci_dev->dev, "error while configuring network device\n");
-		return status;
+		goto undo_irq_setup;
 	}
 
+	/* only irq setup uses non managed APIs, everything else will be freed automatically */
 	status = rtl8169_netdev_init(ctx);
 	if (status < 0)
-		return status;
+		goto undo_irq_setup;
 
 	/* prepare PHY */
 	status = phy_connect_direct(ctx->ndev, ctx->phydev, rtl8169_phylink_handler, PHY_INTERFACE_MODE_GMII);
 	if (status)
-		return status;
+		goto undo_irq_setup;
 
 	phy_attached_info(ctx->phydev);
 	phy_init_hw(ctx->phydev);
@@ -609,6 +606,12 @@ static int rtl8169_probe(struct pci_dev *pci_dev, const struct pci_device_id *id
 
 	dev_info(&pci_dev->dev, "rtl8169 probe successful\n");
 	return 0;
+
+undo_irq_setup:
+	devm_free_irq(&pci_dev->dev, ctx->irq, ctx);
+undo_irq_alloc:
+	pci_free_irq_vectors(pci_dev);
+	return status;
 }
 
 static void rtl8169_remove(struct pci_dev *pci_dev)
