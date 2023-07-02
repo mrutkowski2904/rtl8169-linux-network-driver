@@ -10,6 +10,7 @@
 #include <linux/etherdevice.h>
 #include <linux/dma-mapping.h>
 
+#define RTL8169_NUM_OF_DESCRIPTORS 128
 #define RTL8169_DATA_BUFF_SIZE 2048
 
 #define RTL8169_MMIO_MAC0 0x00
@@ -52,8 +53,10 @@
 #define RTL8169_MMIO_INT_FLAG_SOFTWARE_SHIFT 8
 #define RTL8169_MMIO_INT_FLAG_TIME_OUT_SHIFT 14
 #define RTL8169_MMIO_INT_FLAG_SYS_ERR_SHIFT 15
-#define RTL8169_MMIO_INT_INIT_MASK ((1 << RTL8169_MMIO_INT_FLAG_RX_OK_SHIFT) | (1 << RTL8169_MMIO_INT_FLAG_RX_ERR_SHIFT) | \
-									(1 << RTL8169_MMIO_INT_FLAG_TX_OK_SHIFT) | (1 << RTL8169_MMIO_INT_FLAG_TX_ERR_SHIFT) | \
+#define RTL8169_MMIO_INT_INIT_MASK ((1 << RTL8169_MMIO_INT_FLAG_RX_OK_SHIFT) |  \
+									(1 << RTL8169_MMIO_INT_FLAG_RX_ERR_SHIFT) | \
+									(1 << RTL8169_MMIO_INT_FLAG_TX_OK_SHIFT) |  \
+									(1 << RTL8169_MMIO_INT_FLAG_TX_ERR_SHIFT) | \
 									(1 << RTL8169_MMIO_INT_FLAG_LINK_CHANGE_SHIFT))
 
 /* TXCFG */
@@ -100,6 +103,12 @@ struct rtl8169_desc
 	u32 bus_addr_high;
 };
 
+struct rtl8169_buffer_info
+{
+	u8 *data_buffer;
+	dma_addr_t data_buffer_bus_addr;
+};
+
 struct rtl8169_context
 {
 	struct pci_dev *pci_dev;
@@ -111,18 +120,15 @@ struct rtl8169_context
 	u16 interrupt_mask;
 	int irq;
 
-	/* 256 byte aligned desciptors */
-	struct rtl8169_desc *rx_descriptor;
-	dma_addr_t rx_descriptor_bus_addr;
+	/* 256 byte aligned rx/tx desciptors */
+	struct rtl8169_desc *rx_descriptors;
+	dma_addr_t rx_descriptors_bus_addr;
+	struct rtl8169_buffer_info *rx_buffers_info;
 
-	struct rtl8169_desc *tx_descriptor;
-	dma_addr_t tx_descriptor_bus_addr;
-
-	u8 *rx_data_buffer;
-	dma_addr_t rx_data_bus_addr;
-
-	u8 *tx_data_buffer;
-	dma_addr_t tx_data_bus_addr;
+	struct rtl8169_desc *tx_descriptors;
+	dma_addr_t tx_descriptors_bus_addr;
+	struct rtl8169_buffer_info *tx_buffers_info;
+	int current_tx_desc_index;
 };
 
 struct rtl8169_net_context
@@ -274,27 +280,40 @@ static void rtl8169_handle_rx(struct rtl8169_context *ctx)
 {
 	u16 rx_size;
 	struct sk_buff *skb;
+	struct rtl8169_desc *current_rx_desc;
+	struct rtl8169_buffer_info *current_rx_buff_info;
 
-	/* get len from descriptor */
-	rx_size = ctx->rx_descriptor->opts1 & 0x3fff;
-
-	skb = netdev_alloc_skb(ctx->ndev, rx_size + 2);
-	if (!skb)
+	for (int i = 0; i < RTL8169_NUM_OF_DESCRIPTORS; i++)
 	{
-		dev_err_ratelimited(&ctx->pci_dev->dev, "could not allocate skb!\n");
-		return;
+		current_rx_desc = &ctx->rx_descriptors[i];
+		current_rx_buff_info = &ctx->rx_buffers_info[i];
+
+		if ((current_rx_desc->opts1 & (1 << RTL8169_RX_DESC_OPTS1_OWN_SHIFT)))
+			continue;
+
+		/* get len from descriptor */
+		rx_size = current_rx_desc->opts1 & 0x3fff;
+
+		skb = netdev_alloc_skb(ctx->ndev, rx_size + 2);
+		if (!skb)
+		{
+			dev_err_ratelimited(&ctx->pci_dev->dev, "could not allocate skb!\n");
+			return;
+		}
+
+		skb_copy_to_linear_data(skb, current_rx_buff_info->data_buffer, rx_size);
+		skb_put(skb, rx_size);
+		skb->protocol = eth_type_trans(skb, ctx->ndev);
+		netif_rx(skb);
+
+		current_rx_desc->opts1 = 0;
+		if (i == (RTL8169_NUM_OF_DESCRIPTORS - 1))
+			current_rx_desc->opts1 |= (1 << RTL8169_RX_DESC_OPTS1_EOR_SHIFT);
+
+		/* mark as ready for rx */
+		current_rx_desc->opts1 |= ((1 << RTL8169_RX_DESC_OPTS1_OWN_SHIFT) |
+								   (RTL8169_DATA_BUFF_SIZE & 0x3fff));
 	}
-
-	skb_copy_to_linear_data(skb, ctx->rx_data_buffer, rx_size);
-	skb_put(skb, rx_size);
-	skb->protocol = eth_type_trans(skb, ctx->ndev);
-	if (netif_rx(skb) == NET_RX_DROP)
-		dev_err_ratelimited(&ctx->pci_dev->dev, "rx skb dropped!\n");
-
-	/* prepare for rx */
-	ctx->rx_descriptor->opts1 = ((1 << RTL8169_RX_DESC_OPTS1_OWN_SHIFT) |
-								 (1 << RTL8169_RX_DESC_OPTS1_EOR_SHIFT) |
-								 (RTL8169_DATA_BUFF_SIZE & 0x3fff));
 }
 
 static irqreturn_t rtl8169_interrupt(int irq, void *data)
@@ -350,9 +369,11 @@ static int rtl8169_ndo_close(struct net_device *dev)
 
 static netdev_tx_t rtl8169_ndo_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
+	int data_size;
 	struct rtl8169_context *ctx;
 	struct rtl8169_net_context *net_ctx;
-	int data_size;
+	struct rtl8169_desc *current_tx_desc;
+	struct rtl8169_buffer_info *current_tx_buff_info;
 
 	net_ctx = netdev_priv(dev);
 	ctx = net_ctx->ctx;
@@ -372,18 +393,30 @@ static netdev_tx_t rtl8169_ndo_start_xmit(struct sk_buff *skb, struct net_device
 		return NETDEV_TX_OK;
 	}
 
-	if (ctx->tx_descriptor->opts1 & (1 << RTL8169_TX_DESC_OPTS1_OWN_SHIFT))
+	current_tx_desc = &ctx->tx_descriptors[ctx->current_tx_desc_index];
+	current_tx_buff_info = &ctx->tx_buffers_info[ctx->current_tx_desc_index];
+	;
+
+	if (current_tx_desc->opts1 & (1 << RTL8169_TX_DESC_OPTS1_OWN_SHIFT))
 		return NETDEV_TX_BUSY;
 
-	memcpy(ctx->tx_data_buffer, skb->data, data_size);
+	memcpy(current_tx_buff_info->data_buffer, skb->data, data_size);
 
-	ctx->tx_descriptor->opts1 = (data_size & 0x3fff);
-	ctx->tx_descriptor->opts1 |= ((1 << RTL8169_TX_DESC_OPTS1_OWN_SHIFT) |
-								  (1 << RTL8169_TX_DESC_OPTS1_EOR_SHIFT) |
-								  (1 << RTL8169_TX_DESC_OPTS1_FS_SHIFT) |
-								  (1 << RTL8169_TX_DESC_OPTS1_LS_SHIFT));
+	current_tx_desc->opts1 = (data_size & 0x3fff);
+	current_tx_desc->opts2 = 0;
 
-	ctx->tx_descriptor->opts2 = 0;
+	ctx->current_tx_desc_index++;
+	if (ctx->current_tx_desc_index == RTL8169_NUM_OF_DESCRIPTORS)
+	{
+		current_tx_desc->opts1 |= (1 << RTL8169_TX_DESC_OPTS1_EOR_SHIFT);
+		ctx->current_tx_desc_index = 0;
+	}
+
+	current_tx_desc->opts1 |= ((1 << RTL8169_TX_DESC_OPTS1_OWN_SHIFT) |
+							   (1 << RTL8169_TX_DESC_OPTS1_FS_SHIFT) |
+							   (1 << RTL8169_TX_DESC_OPTS1_LS_SHIFT));
+
+	wmb();
 
 	/* notify the card that tx is pending */
 	iowrite8(RTL8169_MMIO_TPPOLL_TX_PENDING_MASK, ctx->mmio_base + RTL8169_MMIO_TPPOLL);
@@ -415,8 +448,10 @@ static int rtl8169_netdev_init(struct rtl8169_context *ctx)
 
 static int rtl8169_chip_init(struct rtl8169_context *ctx)
 {
-	struct mii_bus *mii;
 	int status;
+	struct mii_bus *mii;
+	struct rtl8169_buffer_info *rx_buff_info, *tx_buff_info;
+	struct rtl8169_desc *rx_descriptor, *tx_descriptor;
 
 	/* reset the chip */
 	rtl8169_reset_chip(ctx);
@@ -425,39 +460,63 @@ static int rtl8169_chip_init(struct rtl8169_context *ctx)
 	for (int i = 0; i < ETH_ALEN; i++)
 		ctx->mac[i] = ioread8(ctx->mmio_base + RTL8169_MMIO_MAC0 + i);
 
-	ctx->rx_descriptor = dmam_alloc_coherent(&ctx->pci_dev->dev, sizeof(struct rtl8169_desc), &ctx->rx_descriptor_bus_addr, GFP_KERNEL);
-	if (ctx->rx_descriptor == NULL)
+	ctx->current_tx_desc_index = 0;
+
+	ctx->rx_descriptors = dmam_alloc_coherent(&ctx->pci_dev->dev, sizeof(struct rtl8169_desc) * RTL8169_NUM_OF_DESCRIPTORS,
+											  &ctx->rx_descriptors_bus_addr, GFP_KERNEL);
+	if (ctx->rx_descriptors == NULL)
 		return -ENOMEM;
 
-	ctx->rx_data_buffer = dmam_alloc_coherent(&ctx->pci_dev->dev, RTL8169_DATA_BUFF_SIZE, &ctx->rx_data_bus_addr, GFP_KERNEL);
-	if (ctx->rx_data_buffer == NULL)
+	ctx->tx_descriptors = dmam_alloc_coherent(&ctx->pci_dev->dev, sizeof(struct rtl8169_desc) * RTL8169_NUM_OF_DESCRIPTORS,
+											  &ctx->tx_descriptors_bus_addr, GFP_KERNEL);
+	if (ctx->tx_descriptors == NULL)
 		return -ENOMEM;
 
-	/* write bus address of the buffer to the rx descriptor */
-	ctx->rx_descriptor->bus_addr_low = ctx->rx_data_bus_addr & DMA_BIT_MASK(32);
-	ctx->rx_descriptor->bus_addr_high = (ctx->rx_data_bus_addr >> 32);
-
-	ctx->rx_descriptor->opts1 = ((1 << RTL8169_RX_DESC_OPTS1_OWN_SHIFT) |
-								 (1 << RTL8169_RX_DESC_OPTS1_EOR_SHIFT) |
-								 (RTL8169_DATA_BUFF_SIZE & 0x3fff));
-
-	/* vlan settings - unused */
-	ctx->rx_descriptor->opts2 = 0;
-
-	/* prepare tx descriptor and its buffer */
-	ctx->tx_descriptor = dmam_alloc_coherent(&ctx->pci_dev->dev, sizeof(struct rtl8169_desc), &ctx->tx_descriptor_bus_addr, GFP_KERNEL);
-	if (ctx->tx_descriptor == NULL)
+	ctx->rx_buffers_info = devm_kzalloc(&ctx->pci_dev->dev, sizeof(struct rtl8169_buffer_info) * RTL8169_NUM_OF_DESCRIPTORS, GFP_KERNEL);
+	if (ctx->rx_buffers_info == NULL)
 		return -ENOMEM;
 
-	ctx->tx_data_buffer = dmam_alloc_coherent(&ctx->pci_dev->dev, RTL8169_DATA_BUFF_SIZE, &ctx->tx_data_bus_addr, GFP_KERNEL);
-	if (ctx->tx_data_buffer == NULL)
+	ctx->tx_buffers_info = devm_kzalloc(&ctx->pci_dev->dev, sizeof(struct rtl8169_buffer_info) * RTL8169_NUM_OF_DESCRIPTORS, GFP_KERNEL);
+	if (ctx->tx_buffers_info == NULL)
 		return -ENOMEM;
 
-	/* write bus address of the buffer to the rx descriptor */
-	ctx->tx_descriptor->bus_addr_low = ctx->tx_data_bus_addr & DMA_BIT_MASK(32);
-	ctx->tx_descriptor->bus_addr_high = (ctx->tx_data_bus_addr >> 32);
-	ctx->tx_descriptor->opts1 |= (1 << RTL8169_TX_DESC_OPTS1_EOR_SHIFT);
-	ctx->tx_descriptor->opts2 = 0;
+	for (int i = 0; i < RTL8169_NUM_OF_DESCRIPTORS; i++)
+	{
+		rx_descriptor = &ctx->rx_descriptors[i];
+		tx_descriptor = &ctx->tx_descriptors[i];
+
+		rx_buff_info = &ctx->rx_buffers_info[i];
+		tx_buff_info = &ctx->tx_buffers_info[i];
+
+		/* rx descriptors */
+		rx_buff_info->data_buffer = dmam_alloc_coherent(&ctx->pci_dev->dev, RTL8169_DATA_BUFF_SIZE,
+														&rx_buff_info->data_buffer_bus_addr, GFP_KERNEL);
+		if (rx_buff_info->data_buffer == NULL)
+			return -ENOMEM;
+
+		rx_descriptor->opts1 = ((1 << RTL8169_RX_DESC_OPTS1_OWN_SHIFT) | (RTL8169_DATA_BUFF_SIZE & 0x3fff));
+		rx_descriptor->opts2 = 0;
+		rx_descriptor->bus_addr_low = rx_buff_info->data_buffer_bus_addr & DMA_BIT_MASK(32);
+		rx_descriptor->bus_addr_high = (rx_buff_info->data_buffer_bus_addr >> 32);
+
+		/* tx descriptors */
+		tx_buff_info->data_buffer = dmam_alloc_coherent(&ctx->pci_dev->dev, RTL8169_DATA_BUFF_SIZE,
+														&tx_buff_info->data_buffer_bus_addr, GFP_KERNEL);
+		if (tx_buff_info->data_buffer == NULL)
+			return -ENOMEM;
+
+		tx_descriptor->opts1 = 0;
+		tx_descriptor->opts2 = 0;
+		tx_descriptor->bus_addr_low = tx_buff_info->data_buffer_bus_addr & DMA_BIT_MASK(32);
+		tx_descriptor->bus_addr_high = (tx_buff_info->data_buffer_bus_addr >> 32);
+
+		/* mark ends of rings */
+		if (i == (RTL8169_NUM_OF_DESCRIPTORS - 1))
+		{
+			rx_descriptor->opts1 |= (1 << RTL8169_RX_DESC_OPTS1_EOR_SHIFT);
+			tx_descriptor->opts1 |= (1 << RTL8169_TX_DESC_OPTS1_EOR_SHIFT);
+		}
+	}
 
 	/* setup PHY */
 	mii = devm_mdiobus_alloc(&ctx->pci_dev->dev);
@@ -509,12 +568,12 @@ static int rtl8169_chip_init(struct rtl8169_context *ctx)
 	iowrite8(0x3B, ctx->mmio_base + RTL8169_MMIO_ETTHR);
 
 	/* write bus address of rx descriptors array to the hardware */
-	iowrite32(ctx->rx_descriptor_bus_addr & DMA_BIT_MASK(32), ctx->mmio_base + RTL8169_MMIO_RDSAR);
-	iowrite32(ctx->rx_descriptor_bus_addr >> 32, ctx->mmio_base + RTL8169_MMIO_RDSAR + 4);
+	iowrite32(ctx->rx_descriptors_bus_addr & DMA_BIT_MASK(32), ctx->mmio_base + RTL8169_MMIO_RDSAR);
+	iowrite32(ctx->rx_descriptors_bus_addr >> 32, ctx->mmio_base + RTL8169_MMIO_RDSAR + 4);
 
 	/* write bus address of tx descriptors array to the hardware */
-	iowrite32(ctx->tx_descriptor_bus_addr & DMA_BIT_MASK(32), ctx->mmio_base + RTL8169_MMIO_TNPDS);
-	iowrite32(ctx->tx_descriptor_bus_addr >> 32, ctx->mmio_base + RTL8169_MMIO_TNPDS + 4);
+	iowrite32(ctx->tx_descriptors_bus_addr & DMA_BIT_MASK(32), ctx->mmio_base + RTL8169_MMIO_TNPDS);
+	iowrite32(ctx->tx_descriptors_bus_addr >> 32, ctx->mmio_base + RTL8169_MMIO_TNPDS + 4);
 
 	/* configure interrupts */
 	iowrite16(RTL8169_MMIO_INT_INIT_MASK, ctx->mmio_base + RTL8169_MMIO_IMASK);
